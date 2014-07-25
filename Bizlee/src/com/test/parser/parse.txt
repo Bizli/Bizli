@@ -1,0 +1,1528 @@
+Imports System.Xml
+Imports System.Globalization
+Imports System.IO
+Imports System.Data
+Imports System.Collections.Specialized
+Imports System.IO.Compression
+Imports Oracle.ManagedDataAccess.Client
+Imports Oracle.ManagedDataAccess.Types
+Imports System.Threading
+
+Public Class Parse
+    Public GlobalRecordID As Integer, Fn As String, FileError As String, CurrentMeterNo As String
+    Dim OKCount As Integer, ErCount As Integer, WaCount As Integer, DupCount As Integer, TotCount As Integer
+    Dim Counter As Integer, PubFolder As String, DestinationFolder As String, StrMDUpdate As String, DefUnitFactor As Single
+    Dim objMutex As Mutex
+    Dim OraError As Boolean
+    Dim ClFiles As New Collection, FirstTime As Boolean
+
+    Private Sub ReadXMLData(FName As String)
+        Dim cSD1 As SD1
+        Dim s As String, SourceFile As String, Warnings As Boolean, Errors As Boolean
+        Dim erms As String
+
+        s = DateTime.Now.Second & " " & DateTime.Now.Millisecond
+
+        lblCurrentFile.Text = PubFolder & "\" & FName
+        SourceFile = PubFolder & "\" & FName
+
+        If Not FName.ToUpper.EndsWith(".XML") Then
+            Exit Sub
+        End If
+
+        Dim xr As XmlReader
+        Try
+            xr = XmlReader.Create(PubFolder & "\" & FName)
+        Catch ee As Exception
+
+            Exit Sub
+        End Try
+
+        If CurCN.State <> ConnectionState.Open Then
+            erms = "Cannot Connect:" & DateTime.Now.ToString & vbCrLf
+            logError(erms)
+            Exit Sub
+        End If
+
+
+        OraError = False
+
+        Try
+            Do While xr.Read()
+                If xr.NodeType = XmlNodeType.Element AndAlso xr.Name = "D1" Then
+                    ProcessD1(xr, CurCN, cSD1)
+
+                    If FileError.Contains(",1,") Or FileError.Contains(",2,") Or FileError.Contains(",3,") Or FileError.Contains(",4,") Or FileError.Contains(",5,") Then
+                        Exit Do
+                    End If
+                End If
+
+                If xr.NodeType = XmlNodeType.Element AndAlso xr.Name = "D2" Then
+                    ProcessD2(xr, CurCN, cSD1)
+                End If
+
+                If xr.NodeType = XmlNodeType.Element AndAlso xr.Name = "D3" Then
+                    ProcessD3(xr, CurCN, cSD1)
+                End If
+
+                If xr.NodeType = XmlNodeType.Element AndAlso xr.Name = "D4" Then
+                    ProcessD4(xr, CurCN, cSD1)
+                End If
+
+                If xr.NodeType = XmlNodeType.Element AndAlso xr.Name = "D5" Then
+                    ProcessD5(xr, CurCN, cSD1)
+                End If
+            Loop
+        Catch ex As Exception
+            OraError = True
+
+            erms = cSD1.MeterNo & ":" & DateTime.Now.ToString
+            erms = erms & ex.Message & ":" & ex.Source & vbCrLf '& ":" & ex.InnerException.ToString
+            logError(erms)
+            FileError = ",20,"
+        End Try
+
+        xr.Dispose()
+
+        Dim ErrorCode As Integer
+
+        Dim StrP As String, ModemDate As String, MeterDate As String
+        If cSD1.ModemTime > #1/1/2010# Then
+            ModemDate = "TO_DATE('" & Format(cSD1.ModemTime, "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+        Else
+            ModemDate = "NULL"
+        End If
+        If cSD1.MeterTime > #1/1/2010# Then
+            MeterDate = "TO_DATE('" & Format(cSD1.MeterTime, "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+        Else
+            MeterDate = "NULL"
+        End If
+
+        Dim FileDetails() As String, DestFile As String, DestFolder As String
+
+        FileDetails = FName.Split(" ")
+
+        If FileDetails.Length > 2 Then
+            If FileError.Length < 2 Then
+                ErrorCode = 1
+                DestFolder = DestinationFolder & "\" & FileDetails(1) & "\processed"
+                OKCount = OKCount + 1
+            ElseIf FileError.Contains(",1,") Or FileError.Contains(",2,") Or FileError.Contains(",20,") Or FileError.Contains(",3,") Or FileError.Contains(",4,") Then
+                ErrorCode = 2
+                DestFolder = DestinationFolder & "\" & FileDetails(1) & "\errors"
+                ErCount = ErCount + 1
+            ElseIf FileError.Contains(",6,") Or FileError.Contains(",7,") Or FileError.Contains(",8,") Then
+                ErrorCode = 3
+                DestFolder = DestinationFolder & "\" & FileDetails(1) & "\warnings"
+                WaCount = WaCount + 1
+            ElseIf FileError.Contains(",5,") Then
+                ErrorCode = 4
+                DestFolder = DestinationFolder & "\" & FileDetails(1) & "\duplicates"
+                DupCount = DupCount + 1
+            End If
+
+            If Not Directory.Exists(DestFolder) Then
+                Directory.CreateDirectory(DestFolder)
+            End If
+
+            DestFile = DestFolder & "\" & FName.Replace(".xml", ".zip")
+
+            If File.Exists(DestFile) Then
+                File.Delete(SourceFile)
+            Else
+                'File.Move(SourceFile, DestFile)
+                Compress(SourceFile, DestFile)
+            End If
+        End If
+
+        StrP = "insert into TblProcessFile(NodeID,MeterNo,ProcessDate,MStatus,MeterDate,ModemDate,ErrorCode,FileName,ErrorDesc) VALUES(" & cSD1.NodeID & ",'" & cSD1.MeterNo & "',SYSDATE,'OK'," & MeterDate & "," & ModemDate & "," & ErrorCode & ",'" & FName & "','" & FileError & "')"
+
+
+        If CurCN.State = ConnectionState.Open Then
+            Dim cmd As OracleCommand = New OracleCommand(StrP, CurCN)
+            ExecuteCommand(cmd)
+        End If
+
+        TotCount = TotCount + 1
+
+        lblTotFiles.Text = TotCount
+        lblOKFiles.Text = OKCount
+        lblErrors.Text = ErCount
+        lblWarnings.Text = WaCount
+        lblRejected.Text = DupCount
+    End Sub
+
+    Private Sub logError(ErrorMsg As String)
+        Dim fl As New System.IO.StreamWriter("c:\parserlog\" & Format(DateTime.Now, "ddMMMyyyy") & ".txt", True)
+        fl.Write(ErrorMsg)
+        fl.Close()
+    End Sub
+
+
+    Private Sub ProcessD1(Xr As XmlReader, CurCn As OracleConnection, ByRef csd As SD1)
+        Dim MeterSr As String, ModemDate As String, MeterDate As String, curCMD As OracleCommand, DateStr As String
+
+        StrMDUpdate = "Update TBLMETERDETAIL SET METERNO=METERNO"
+
+        Do While Xr.Read()
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "D1" Then
+                If csd.MeterNo Is Nothing Then
+                    FileError = FileError & ",1,"
+                    Exit Sub
+                End If
+
+                curCMD = New OracleCommand
+                curCMD.Connection = CurCn
+                curCMD.CommandType = CommandType.StoredProcedure
+                curCMD.CommandText = "spInsertFileHeader1"
+
+                curCMD.Parameters.Add("pMeterNo", OracleDbType.Varchar2, 25)
+                curCMD.Parameters("pMeterNo").Value = csd.MeterNo
+
+                curCMD.Parameters.Add("pProcessDate", OracleDbType.TimeStamp)
+                curCMD.Parameters("pProcessDate").Value = DateTime.Now
+
+                curCMD.Parameters.Add("pMStatus", OracleDbType.Varchar2, 25)
+                curCMD.Parameters("pMStatus").Value = ""
+
+                curCMD.Parameters.Add("pMeterDate", OracleDbType.TimeStamp)
+                curCMD.Parameters("pMeterDate").Value = csd.MeterTime
+
+                curCMD.Parameters.Add("pModemDate", OracleDbType.TimeStamp)
+                curCMD.Parameters("pModemDate").Value = IIf(csd.ModemTime < #1/1/2000#, DateTime.Now, csd.ModemTime)
+
+                curCMD.Parameters.Add("pErrorCode", OracleDbType.Int32)
+                curCMD.Parameters("pErrorCode").Value = 1
+
+                curCMD.Parameters.Add("pNodeID", OracleDbType.Decimal)
+                curCMD.Parameters("pNodeID").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pLastLSDate", OracleDbType.Varchar2, 20)
+                curCMD.Parameters("pLastLSDate").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pLastLSIP", OracleDbType.Decimal)
+                curCMD.Parameters("pLastLSIP").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pLastBillingDate", OracleDbType.Varchar2, 20)
+                curCMD.Parameters("pLastBillingDate").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pLastEventDate", OracleDbType.Varchar2, 20)
+                curCMD.Parameters("pLastEventDate").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pLastFileDate", OracleDbType.Varchar2, 20)
+                curCMD.Parameters("pLastFileDate").Direction = ParameterDirection.Output
+
+                curCMD.Parameters.Add("pInActive", OracleDbType.Decimal)
+                curCMD.Parameters("pInActive").Direction = ParameterDirection.Output
+
+                Dim LastReadDate As DateTime, MeterInActive As Integer
+                Try
+                    curCMD.ExecuteNonQuery()
+                Catch ee As Exception
+
+                    OraError = True
+                    logError(vbCrLf & ee.Message & " " & DateTime.Now.ToString)
+                    'MsgBox(ee.Message)
+                End Try
+                csd.NodeID = Val(curCMD.Parameters("pNodeID").Value.ToString)
+                If csd.NodeID = 0 Then
+                    FileError = FileError & ",1,"
+                    Exit Sub
+                End If
+                csd.LastBillingDate = DateTime.Parse(curCMD.Parameters("pLastBillingDate").Value.ToString)
+                csd.LastLSDate = DateTime.Parse(curCMD.Parameters("pLastLSDate").Value.ToString)
+                csd.LastLSIP = Val(curCMD.Parameters("pLastLSIP").Value.ToString)
+                csd.LastEventDate = DateTime.Parse(curCMD.Parameters("pLastEventDate").Value.ToString)
+                LastReadDate = DateTime.Parse(curCMD.Parameters("pLastFileDate").Value.ToString)
+                MeterInActive = curCMD.Parameters("pInActive").Value.ToString
+
+                If csd.InvalidMeterTimeFormat Then
+                    FileError = FileError & ",2,"
+                End If
+                If csd.ModemTime > #1/1/2010# Then
+                    If DateDiff(DateInterval.Minute, csd.ModemTime, csd.MeterTime) > 120 And DateDiff(DateInterval.Minute, csd.ModemTime, csd.MeterTime) < -120 Then
+                        FileError = FileError & ",4,"
+                    End If
+                End If
+                If LastReadDate >= csd.MeterTime Then
+                    FileError = FileError & ",3,"
+
+                End If
+                If LastReadDate = csd.MeterTime Then
+                    FileError = FileError & ",5,"
+                End If
+                If csd.NodeID = 0 Then
+                    FileError = FileError & ",1,"
+                End If
+                If MeterInActive = 1 Then
+                    FileError = FileError & ",6,"
+                End If
+
+                Dim MDCmd As OracleCommand
+                StrMDUpdate = StrMDUpdate & " Where MeterNo='" & csd.MeterNo & "'"
+                MDCmd = New OracleCommand(StrMDUpdate, CurCn)
+                ExecuteCommand(MDCmd)
+
+                Exit Sub
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G1" Then
+                Xr.Read()
+                MeterSr = Xr.Value
+                csd.MeterNo = MeterSr
+                CurrentMeterNo = MeterSr
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G2" Then
+                Xr.Read()
+                DateStr = Xr.Value.Trim
+
+                Dim myDateFormat As String = "dd-MM-yyyy HH:mm:ss"
+                Dim outputDateTime As DateTime
+
+                If DateTime.TryParseExact(DateStr, myDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, outputDateTime) Then
+                    csd.MeterTime = outputDateTime
+                Else
+                    csd.InvalidMeterTimeFormat = True
+                End If
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G3" Then
+                Xr.Read()
+                DateStr = Xr.Value.Trim
+
+                Dim myDateFormat As String = "dd-MM-yyyy HH:mm:ss"
+                Dim outputDateTime As DateTime
+
+                If DateTime.TryParseExact(DateStr, myDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, outputDateTime) Then
+                    csd.ModemTime = outputDateTime
+                Else
+                    csd.InvalidMeterTimeFormat = True
+                End If
+            End If
+
+            Dim StrG As String
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G7" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",PTPRIMARYTOSEC=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G8" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",CTPRIMARYTOSEC=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G9" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",PROGPTPRIMARY=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G10" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",PROGCTPRIMARY=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G11" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",PROGPTSECONDARY=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G12" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",PROGCTSECONDARY=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G13" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",METERCLASS='" & StrG & "'"
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G14" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",METERRATING='" & StrG & "'"
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G15" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",METERTYPE='" & StrG & "'"
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G16" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",METERSCALING=" & Val(StrG)
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G17" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",METERPROGNAME='" & StrG & "'"
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "G22" Then
+                Xr.Read()
+                StrG = Xr.Value.Trim
+                StrMDUpdate = StrMDUpdate & ",MANUFACTURECODE='" & StrG & "'"
+            End If
+
+        Loop
+    End Sub
+
+    Private Sub ProcessD2(Xr As XmlReader, CurCn As OracleConnection, ByVal csd1 As SD1)
+        Dim MS As New MemoryStream
+        Dim csd As SD2
+        Dim AttrID As Int16, AttrCnt As Integer, Bytcount As Integer
+        Dim ValByt() As Byte, PrmCount(0) As Byte, ConvError As Boolean
+
+        PrmCount(0) = 0
+        MS.Write(PrmCount, 0, 1)
+
+        Do While Xr.Read()
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "D2" Then
+
+                ValByt = New Byte(CType(MS.Length, Integer)) {}
+                MS.Seek(0, SeekOrigin.Begin)
+                Bytcount = MS.Read(ValByt, 0, MS.Length)
+
+                ValByt(0) = PrmCount(0) 'update no of parameters
+
+                Dim strQuery As String = "insert into tblInstData(RecordID, NodeID, MeterNo, RecordDate, instData) values (INSTIDS.NEXTVAL,:NodeID,'" & CurrentMeterNo & "', TO_DATE('" & Format(csd1.MeterTime, "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS'), :InstData)"
+                Dim cmd As OracleCommand = New OracleCommand(strQuery, CurCn)
+                cmd.Parameters.Add("NodeID", OracleDbType.Int32).Value = csd1.NodeID
+                cmd.Parameters.Add("InstData", OracleDbType.Raw).Value = ValByt
+                cmd.ExecuteNonQuery()
+
+                Exit Sub
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "INSTPARAM" Then
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+
+                    csd.PrmCOde = Xr.GetAttribute("CODE")
+                    csd.PrmUnit = Xr.GetAttribute("UNIT")
+                    csd.PrmValue = Xr.GetAttribute("VALUE")
+
+                    AttrID = getPrmID(csd.PrmCOde)
+                    csd.PrmID = AttrID
+
+
+                    If AttrID > 0 And IsNumeric(csd.PrmValue) Then
+                        DefUnitFactor = 1
+                        If csd.PrmUnit Is Nothing Then
+                            csd.PrmUnit = ""
+                        Else
+                            csd.PrmUnit = csd.PrmUnit.ToString.ToUpper.Trim
+                        End If
+
+
+                        DefUnitFactor = GetUnitConv(csd.PrmCOde, csd.PrmUnit)
+
+                        ConvError = False
+                        Try
+                            csd.RealVal = CType(csd.PrmValue, Single) * DefUnitFactor
+                        Catch
+                            ConvError = True
+                        End Try
+
+                        If Not ConvError Then
+                            Dim byteArray As Byte() = BitConverter.GetBytes(AttrID)
+                            Dim byteArray2 As Byte() = BitConverter.GetBytes(csd.RealVal)
+
+                            PrmCount(0) = PrmCount(0) + 1
+                            MS.Write(byteArray, 0, 2)
+
+                            MS.Write(byteArray2, 0, 4)
+                        End If
+
+                    End If
+                End If
+            End If
+        Loop
+    End Sub
+
+
+    Private Function GetUnitConv(PrmCOde As String, PrmUnit As String)
+        Dim DefU As String, PrmCat As String, DefUnitFactor As Single
+        DefUnitFactor = 1
+        PrmCat = PrmCOde.Substring(0, 2)
+
+        If PrmCat = "P1" Then
+            DefU = "V"
+            If Not PrmUnit = DefU Then
+
+            End If
+        ElseIf PrmCat = "P2" Then
+            DefU = "A"
+            If Not PrmUnit = DefU Then
+
+            End If
+        ElseIf PrmCat = "P3" Then
+            DefU = "K"
+            If Not PrmUnit = DefU Then
+                If PrmUnit = "M" Then
+                    DefUnitFactor = 1000
+                End If
+                If PrmUnit = "G" Then
+                    DefUnitFactor = 1000000
+                End If
+            End If
+        ElseIf PrmCat = "P7" Then
+            DefU = "K"
+            If Not PrmUnit = DefU Then
+                If Not PrmUnit = DefU Then
+                    If PrmUnit = "M" Then
+                        DefUnitFactor = 1000
+                    End If
+                    If PrmUnit = "G" Then
+                        DefUnitFactor = 1000000
+                    End If
+                End If
+            End If
+        End If
+
+        Return DefUnitFactor
+    End Function
+
+    Private Sub ProcessD3(Xr As XmlReader, CurCn As OracleConnection, ByRef csd As SD1)
+        Dim Mechanism As String, ProfileDate As String, AttrValue As String, CurParamID As Int16
+        Dim LastBillDate As DateTime, SectionDate As DateTime
+
+        Dim OuterSection As Integer, TempRecordID As Integer
+        Dim values() As String
+        Dim outputDateTime As DateTime, CurrentDate As DateTime
+        Dim ODate As DateTime
+
+        Dim dtBL As New DataTable, dtBLCurrent As New DataTable, dtBLHdr As DataTable, Dr As DataRow, DrH As DataRow, NdName As String
+        Dim TODStartsFrom0 As Boolean
+
+        TODStartsFrom0 = False
+
+        dtBL = GetD3DataTable()
+        dtBLCurrent = GetD3DataTable()
+        dtBLHdr = GetD3HeaderDataTable()
+
+        dtBLCurrent.TableName = "CURRENT"
+
+        TempRecordID = 0
+
+        Do While Xr.Read()
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "B1" Then
+                TempRecordID = TempRecordID
+            End If
+
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "D3" Then
+
+                SaveD3Header(dtBLHdr)
+                SaveD3Detail(dtBL)
+
+                If dtBLCurrent.Rows.Count > 0 Then
+                    Dim jj As Byte() = CompressData(dtBLCurrent)
+                    'Dim kk As DataTable = DecompressData(jj)
+
+                    Dim iData1() As Byte, iData2() As Byte, iData3() As Byte, iData4() As Byte, TotLen As Integer
+
+                    TotLen = jj.Length
+                    If TotLen > 2000 Then
+                        ReDim iData1(1999)
+                        Array.Copy(jj, 0, iData1, 0, 2000)
+                    Else
+                        ReDim iData1(TotLen - 1)
+                        iData1 = jj
+                    End If
+
+                    If TotLen > 2000 And TotLen <= 4000 Then
+                        ReDim iData2(jj.Length - (2001))
+                        Array.Copy(jj, 2000, iData2, 0, jj.Length - 2000)
+                    ElseIf TotLen > 4000 Then
+                        ReDim iData2(1999)
+                        Array.Copy(jj, 2000, iData2, 0, 2000)
+                    Else
+                        ReDim iData2(0)
+                        iData2(0) = 0
+                    End If
+
+                    If TotLen > 4000 And TotLen <= 6000 Then
+                        ReDim iData3(jj.Length - (4001))
+                        Array.Copy(jj, 4000, iData3, 0, jj.Length - 4000)
+                    ElseIf TotLen > 6000 Then
+                        ReDim iData3(1999)
+                        Array.Copy(jj, 4000, iData3, 0, 2000)
+                    Else
+                        ReDim iData3(0)
+                        iData3(0) = 0
+                    End If
+
+                    If TotLen > 6000 Then
+                        ReDim iData4(jj.Length - (6001))
+                        Array.Copy(jj, 6000, iData4, 0, jj.Length - 6000)
+                    Else
+                        ReDim iData4(0)
+                        iData4(0) = 0
+                    End If
+
+                    Dim strQuery As String = "insert into tblBillCurrent(NodeID, MeterNo, RecordDate, Totlen,instData1,instData2,instData3,instData4) values (:Mid,'" & csd.MeterNo & "', :RecDate, :Tlen, :Data1, :Data2, :Data3, :Data4)"
+                    Dim cmd As OracleCommand = New OracleCommand(strQuery, CurCn)
+                    cmd.Parameters.Add(":Mid", OracleDbType.Int32).Value = csd.NodeID
+                    cmd.Parameters.Add(":RecDate", OracleDbType.TimeStamp).Value = csd.MeterTime
+                    cmd.Parameters.Add(":Tlen", OracleDbType.Int32).Value = jj.Length
+                    cmd.Parameters.Add(":Data1", OracleDbType.Raw).Value = iData1
+                    cmd.Parameters.Add(":Data2", OracleDbType.Raw).Value = iData2
+                    cmd.Parameters.Add(":Data3", OracleDbType.Raw).Value = iData3
+                    cmd.Parameters.Add(":Data4", OracleDbType.Raw).Value = iData4
+
+                    cmd.ExecuteNonQuery()
+
+                End If
+
+                Exit Sub
+
+            End If
+
+            NdName = Xr.Name
+
+            Dim DateFound As Boolean
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "D3-00" Then
+                Mechanism = Xr.GetAttribute("MECHANISM")
+                ProfileDate = Xr.GetAttribute("DATETIME") & ":00"
+                DateFound = True
+                OuterSection = 2
+
+                TODStartsFrom0 = False
+
+            ElseIf Xr.NodeType = XmlNodeType.Element AndAlso (Xr.Name = "D3-01" Or Xr.Name = "D3-02" Or Xr.Name = "D3-03" Or Xr.Name = "D3-04" Or Xr.Name = "D3-05" Or Xr.Name = "D3-06" Or Xr.Name = "D3-07" Or Xr.Name = "D3-08" Or Xr.Name = "D3-09" Or Xr.Name = "D3-10" Or Xr.Name = "D3-11" Or Xr.Name = "D3-12") Then
+                Mechanism = Xr.GetAttribute("MECHANISM")
+                ProfileDate = Xr.GetAttribute("DATETIME")
+
+                TODStartsFrom0 = False
+
+                If DateTime.TryParseExact(ProfileDate, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, CurrentDate) Then
+                End If
+                OuterSection = 1
+
+                DateFound = False
+
+                Dr = dtBLHdr.NewRow
+                ' TempRecordID = System.Threading.Interlocked.Increment(GlobalRecordID) ' Val(NdName.Substring(2)) 'GETRECORDID FUNCTION
+                Dr("RecordID") = 0 'TempRecordID
+                Dr("NodeID") = csd.NodeID
+                Dr("MeterNo") = csd.MeterNo
+                Dr("MECHANISM") = Mechanism
+
+                If DateTime.TryParseExact(ProfileDate, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, SectionDate) Then
+                    Dr("RECORDTIME") = SectionDate
+                    DateFound = True
+                Else
+                    ProfileDate = Xr.GetAttribute("DATETIME") & ":00"
+                    If DateTime.TryParseExact(ProfileDate, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, SectionDate) Then
+                        Dr("RECORDTIME") = SectionDate
+                        DateFound = True
+                    End If
+                End If
+
+                If DateFound Then
+                    If SectionDate > csd.LastBillingDate Then
+                        TempRecordID = System.Threading.Interlocked.Increment(GlobalRecordID) ' Val(NdName.Substring(2)) 'GETRECORDID FUNCTION
+                        Dr("RecordID") = TempRecordID
+
+                        dtBLHdr.Rows.Add(Dr)
+                    Else
+                        TempRecordID = 0
+                        DateFound = DateFound
+                    End If
+                End If
+            End If
+
+            'B2 NOT CODED
+            Dim DefUnitFactor As Single, prmUnit As String, prmCode As String
+
+            If NdName = "B1" Or NdName = "B3" Or NdName = "B4" Or NdName = "B5" Or NdName = "B6" Or NdName = "B7" Or NdName = "B8" Or NdName = "B9" Or NdName = "B10" Or NdName = "B11" Or NdName = "B12" Or NdName = "B17" Then
+                If OuterSection = 2 Then
+                    Dr = dtBLCurrent.NewRow
+                ElseIf OuterSection = 1 Then
+                    Dr = dtBL.NewRow
+                End If
+
+                Dr("RecordID") = TempRecordID
+                Dr("SECTION") = NdName.Substring(1)
+                Dr("NodeID") = csd.NodeID
+                Dr("MeterNo") = csd.MeterNo
+
+                If NdName = "B3" Or NdName = "B4" Or NdName = "B5" Or NdName = "B6" Then
+                    AttrValue = Xr.GetAttribute("PARAMCODE")
+                    Dr("PARAMCODE") = AttrValue
+                    prmCode = AttrValue
+                    CurParamID = getPrmID(AttrValue)
+                    Dr("ParamID") = CurParamID
+
+                    AttrValue = Xr.GetAttribute("UNIT")
+                    DefUnitFactor = 1
+                    prmUnit = AttrValue
+                    prmUnit = prmUnit.ToString.ToUpper.Trim
+
+                    DefUnitFactor = GetUnitConv(prmCode, prmUnit)
+
+                    'Dr("UNIT") = AttrValue
+                    AttrValue = Xr.GetAttribute("VALUE")
+                    If IsNumeric(AttrValue) Then
+                        If DefUnitFactor = 1 Then
+                            Dr("PARAMVALUE") = Val(AttrValue)
+                        Else
+                            Dr("PARAMVALUE") = Val(AttrValue) * DefUnitFactor
+                        End If
+                        Dr("INPUTUNIT") = prmUnit
+                        Dr("INPUTVALUE") = Val(AttrValue)
+                    End If
+
+                End If
+                If NdName = "B5" Or NdName = "B6" Then
+                    AttrValue = Xr.GetAttribute("OCCDATE")
+                    If Not AttrValue Is Nothing Then
+                        If AttrValue.Length > 2 Then
+                            If DateTime.TryParseExact(AttrValue, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, ODate) Then
+                                Dr("OCCDATE") = ODate
+
+                            Else
+                                'MsgBox(1)
+                            End If
+
+                        End If
+                    End If
+                End If
+                If NdName = "B4" Or NdName = "B6" Or NdName = "B8" Then
+
+                    AttrValue = Xr.GetAttribute("TOD")
+                    If AttrValue = "0" Then TODStartsFrom0 = True
+                    Dr("TOD") = AttrValue + IIf(TODStartsFrom0, 1, 0)
+                End If
+                If NdName = "B9" Then
+                    AttrValue = Xr.GetAttribute("PARAMCODE")
+                    Dr("PARAMCODE") = AttrValue
+                    CurParamID = getPrmID(AttrValue)
+
+                    Dr("ParamID") = CurParamID
+
+                    AttrValue = Xr.GetAttribute("VALUE")
+                    If IsNumeric(AttrValue) Then
+                        Dr("PARAMVALUE") = AttrValue
+                    End If
+                End If
+                If NdName = "B10" Then
+                    AttrValue = Xr.GetAttribute("PARAMCODE")
+                    Dr("PARAMCODE") = AttrValue
+                    CurParamID = getPrmID(AttrValue)
+
+                    Dr("ParamID") = CurParamID
+
+                    AttrValue = Xr.GetAttribute("VALUE")
+                    If IsNumeric(AttrValue) Then
+                        Dr("PARAMVALUE") = AttrValue
+                    End If
+
+                    AttrValue = Xr.GetAttribute("TOD")
+                    If AttrValue = "0" Then TODStartsFrom0 = True
+                    Dr("TOD") = AttrValue + IIf(TODStartsFrom0, 1, 0)
+                End If
+                If NdName = "B11" Or NdName = "B12" Or NdName = "B17" Then
+                    AttrValue = Xr.GetAttribute("VALUE")
+                    Dr("PARAMVALUE") = AttrValue
+                End If
+
+                If OuterSection = 2 Then
+                    dtBLCurrent.Rows.Add(Dr)
+                ElseIf OuterSection = 1 Then
+                    If DateFound Then
+                        If SectionDate > csd.LastBillingDate Then
+                            dtBL.Rows.Add(Dr)
+                        Else
+                            DateFound = DateFound
+                        End If
+                    End If
+
+                End If
+            End If
+        Loop
+
+    End Sub
+
+
+    Private Sub ProcessD4(Xr As XmlReader, CurCn As OracleConnection, csd1 As SD1)
+        Dim iPeriod As String, ipInterval As String, ProfileDate As String, PCode As String, PUnit As String, PValue As String, I As Integer, AttrCnt As Integer, AttrName As String, AttrValue As String
+        Dim prmContent As UInteger, CurPrmId As Integer, sdBytes() As Byte
+        Dim ParamID(20) As Int16, ParamVal(20) As Single, ParamCount As Integer, LastDate As Date, CurDate As Date
+        Dim ValByt As Byte(), Bytcount As Integer, EmptyCount As Integer
+        Dim MemS As MemoryStream, HdrSaved As Boolean, GreaterThanLastDate As Integer, GreaterThanLastIP As Boolean, StrUpdate As String
+        Dim FirstParamCount As Integer, FromInterval As Integer, ToInterval As Integer
+
+        LastDate = csd1.LastLSDate ' #1/1/2013#
+
+        iPeriod = Xr.GetAttribute("INTERVALPERIOD")
+        
+        Do While Xr.Read()
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "D4" Then
+                Exit Sub
+            End If
+
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "DAYPROFILE" Then
+                If CurDate >= LastDate And FromInterval > 0 Then
+                    Dim iData1() As Byte, iData2() As Byte
+                    ValByt = New Byte(CType(MemS.Length, Integer)) {}
+                    MemS.Seek(0, SeekOrigin.Begin)
+                    Bytcount = MemS.Read(ValByt, 0, MemS.Length)
+
+                    Dim strQuery As String = "insert into tblLSData(RecordID,NodeID,MeterNo, RecordDate,IntervalPeriod,FromInterval,ToInterval, iData1,iData2,EmptyCount) values (LSIDS.NEXTVAL," & csd1.NodeID & ",'" & csd1.MeterNo & "', TO_DATE('" & Format(CurDate, "dd-MMM-yyyy") & "','DD-MON-YYYY')," & iPeriod & "," & FromInterval & "," & ToInterval & ",:lsData1,:lsData2," & EmptyCount & ")"
+                    Dim cmd As OracleCommand = New OracleCommand(strQuery, CurCn)
+
+                    If ValByt.Length <= 2000 Then
+                        cmd.Parameters.Add("lsData1", OracleDbType.Raw).Value = ValByt
+                        ReDim iData2(0)
+                        cmd.Parameters.Add("lsData2", OracleDbType.Raw).Value = iData2
+                    Else
+                        ReDim iData1(1999)
+                        ReDim iData2(ValByt.Length - (2001))
+
+                        Array.Copy(ValByt, 0, iData1, 0, 2000)
+                        Array.Copy(ValByt, 2000, iData2, 0, ValByt.Length - 2000)
+                        If ValByt.Length > 2000 Then
+                            ReDim iData1(1999)
+                            ReDim iData2(ValByt.Length - (2001))
+
+                            Array.Copy(ValByt, 0, iData1, 0, 2000)
+                            Array.Copy(ValByt, 2000, iData2, 0, ValByt.Length - 2000)
+
+                        Else
+                            ReDim iData1(ValByt.Length - 1)
+                            ReDim iData2(0)
+
+                            Array.Copy(ValByt, 0, iData1, 0, ValByt.Length)
+
+                            iData2(0) = 0
+                        End If
+
+                        cmd.Parameters.Add("lsData1", OracleDbType.Raw).Value = iData1
+                        cmd.Parameters.Add("lsData2", OracleDbType.Raw).Value = iData2
+                    End If
+
+                    EmptyCount = 0
+
+                    If DateDiff(DateInterval.Hour, CurDate, DateTime.Now) > 24 Then
+                        cmd.ExecuteNonQuery()
+                    End If
+                End If
+
+
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "DAYPROFILE" Then
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+                    prmContent = 0
+                    ProfileDate = Xr.GetAttribute("DATE")
+                    FromInterval = 0
+                    ToInterval = 0
+
+                    EmptyCount = 0
+
+                    'CurDate = CDate(ProfileDate)
+                    If DateTime.TryParseExact(ProfileDate, "dd-MM-yyyy", CultureInfo.InvariantCulture, DateTimeStyles.None, CurDate) Then
+
+                    End If
+
+                    If CurDate < LastDate Then
+                        GreaterThanLastDate = -1
+                    ElseIf CurDate = LastDate Then
+                        GreaterThanLastDate = 1
+                    ElseIf CurDate > LastDate Then
+                        GreaterThanLastDate = 2
+
+                    End If
+                    If CurDate < LastDate Then
+                        'Xr.ReadToFollowing("DAYPROFILE")
+                    Else
+                        '  MsgBox("abc")
+                        MemS = New MemoryStream
+                    End If
+                    HdrSaved = False
+                End If
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "IP" Then
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+
+                    ipInterval = Xr.GetAttribute("INTERVAL")
+                    If ipInterval = "40" Then
+                        ParamCount = 0
+                    End If
+                    ParamCount = 0
+                End If
+            End If
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "PARAMETER" Then
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+
+
+                    PCode = Xr.GetAttribute("PARAMCODE")
+                    PUnit = Xr.GetAttribute("UNIT")
+                    PValue = Xr.GetAttribute("VALUE")
+
+                    CurPrmId = getPrmID(PCode)
+                    Dim DefUnitFactor As Single
+                    DefUnitFactor = 1
+                    PUnit = PUnit.ToString.ToUpper.Trim
+
+                    DefUnitFactor = GetUnitConv(PCode, PUnit)
+
+                    If IsNumeric(PValue) Then
+                        ParamID(ParamCount) = CurPrmId
+                        ParamVal(ParamCount) = Val(PValue) * DefUnitFactor
+
+                        ParamCount = ParamCount + 1
+                    End If
+                End If
+            End If
+
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "IP" Then
+                If CurDate > LastDate Or (CurDate = LastDate And ipInterval > csd1.LastLSIP) Then
+                    If ParamCount > 0 Then
+                        If Not HdrSaved Then
+                            FirstParamCount = ParamCount
+                            FromInterval = ipInterval
+                        End If
+
+                        ToInterval = ipInterval
+
+                        If FirstParamCount = ParamCount Then
+                            WriteToMS(MemS, ParamID, ParamVal, ParamCount, ipInterval, HdrSaved)
+                        Else
+                            'MsgBox(1)
+                        End If
+                    Else
+                        EmptyCount = EmptyCount + 1
+                    End If
+                End If
+            End If
+        Loop
+
+    End Sub
+
+    Private Sub WriteToMS(ByRef MS As MemoryStream, ByRef PrmIDs() As Int16, ByRef PrmVals() As Single, PrmCount As Integer, Intrvl As Integer, ByRef hdrsaved As Boolean)
+        Dim DiffHdr As Boolean
+        Dim bytHdr() As Byte, valHdr() As Byte, Hdr(2) As Byte
+
+        If hdrsaved Then
+            Hdr(0) = 1
+            Hdr(1) = PrmCount
+            Hdr(2) = Intrvl
+        Else
+            Hdr(0) = 2
+            Hdr(1) = PrmCount
+            Hdr(2) = Intrvl
+        End If
+
+
+        MS.Write(Hdr, 0, 3)
+
+        bytHdr = New Byte(2 * PrmCount) {}
+        valHdr = New Byte(4 * PrmCount) {}
+
+        If Not hdrsaved Then
+            Buffer.BlockCopy(PrmIDs, 0, bytHdr, 0, 2 * PrmCount)
+            MS.Write(bytHdr, 0, 2 * PrmCount)
+        End If
+
+        hdrsaved = True
+
+        Buffer.BlockCopy(PrmVals, 0, valHdr, 0, 4 * PrmCount)
+
+        MS.Write(valHdr, 0, 4 * PrmCount)
+
+    End Sub
+
+    Private Sub ProcessD5(Xr As XmlReader, CurCn As OracleConnection, ByVal csd1 As SD1)
+        Dim MS As New MemoryStream
+        Dim csd As SD5, DT As DataTable, Dr As DataRow
+        Dim AttrID As Int16, AttrCnt As Integer, Bytcount As Integer, CurEventDesc As String, FindEvent As Boolean
+        Dim ValByt() As Byte, LastClearValByt() As Byte, PrmCount(0) As Byte, LastStatus As String, LastEventCode As String, TimeStr As String, Duration As String, DurationSec As Integer
+        Dim dtAlarmCodes As New DataTable, DrCode As DataRow, StrCodes As String, DictCodes As New Dictionary(Of Int16, Int16), ClearTime As DateTime
+        Dim LastClearTime As DateTime, LastClearNotSet As Boolean, LastClearCode As String
+
+        StrCodes = "select Distinct EventCode From TblAlarmGroupDetail WHERE GroupNodeID IN(SELECT NodeID FROM TBLNODES START WITH NodeID=" & csd1.NodeID & " CONNECT BY NodeID=PRIOR PARENTNodeID)"
+        dtAlarmCodes = GetTable(StrCodes, CurCn)
+
+        For Each DrCode In dtAlarmCodes.Rows
+            DictCodes.Add(DrCode("EventCode"), DrCode("EventCode"))
+        Next
+
+        LastStatus = "-1"
+        LastEventCode = "99"
+        DT = GetD5DataTable()
+
+        If csd1.NodeID = 351 Then
+            ' MsgBox(Fn)
+        End If
+
+        Do While Xr.Read()
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "D5" Then
+                If DT.Rows.Count > 0 Then
+                    SaveD5(DT)
+                End If
+                Exit Sub
+            End If
+
+
+            If Xr.NodeType = XmlNodeType.EndElement AndAlso Xr.Name = "EVENT" Then
+
+                ValByt = New Byte(CType(MS.Length, Integer)) {}
+                MS.Seek(0, SeekOrigin.Begin)
+                Bytcount = MS.Read(ValByt, 0, MS.Length)
+
+                ValByt(0) = PrmCount(0) 'update no of parameters
+                If Not Dr Is Nothing Then
+                    If LastStatus = "1" Then
+                        Dr("ParamValuesON") = ValByt
+                    ElseIf LastStatus = "0" Then
+                        Dr("ParamValuesOFF") = ValByt
+                    End If
+                Else
+                    If LastStatus = "1" Then
+                        LastClearValByt = ValByt
+                    End If
+                End If
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "EVENT" Then
+                MS = New MemoryStream
+                PrmCount(0) = 0
+                MS.Write(PrmCount, 0, 1)
+
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+
+                    csd.Code = Xr.GetAttribute("CODE")
+                    csd.Status = Xr.GetAttribute("STATUS")
+                    csd.EDesc = GetEventDesc(Val(csd.Code))
+
+                    If csd.Status = "1" Then
+                        Dim Drc As DataRow
+                        If csd.Code = LastEventCode Then
+
+                        End If
+
+                        LastClearNotSet = False
+
+                        Duration = Xr.GetAttribute("DURATION")
+                        DurationSec = 5
+                        If Duration Is Nothing Then
+                            TimeStr = Xr.GetAttribute("TIME")
+                            If TimeStr Is Nothing Then
+                                TimeStr = Xr.GetAttribute("DATETIME")
+                            End If
+                            If DateTime.TryParseExact(TimeStr, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, ClearTime) Then
+                            Else
+                                DateTime.TryParseExact(TimeStr, "dd-MM-yyyy hh:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, ClearTime)
+                            End If
+
+                            FindEvent = False
+                            If csd.Code = LastEventCode Then
+                                If Dr IsNot Nothing Then
+                                    If Dr("EventTime") > ClearTime Then
+                                        FindEvent = True
+                                    End If
+                                End If
+                            End If
+
+                            If csd.Code <> LastEventCode Or FindEvent Then
+                                Dr = Nothing
+                                For Each Drc In DT.Rows
+                                    If Drc("eventcode") = csd.Code Or Dr Is Nothing Then
+                                        If IsDBNull(Drc("cleartime")) And Drc("EventTime") <= ClearTime Then
+                                            Dr = Drc
+                                            Exit For
+                                        End If
+                                    End If
+                                Next
+                            End If
+
+                            If Not Dr Is Nothing Then
+                                DurationSec = DateDiff(DateInterval.Second, Dr("EventTime"), ClearTime)
+                                Duration = GetDurationStr(DurationSec)
+
+                                Dr("Duration") = Duration
+                                Dr("DurationSec") = DurationSec
+                                Dr("ClearTime") = ClearTime
+
+                                If DurationSec < 0 Then
+                                    DurationSec = DurationSec
+                                End If
+                            Else
+                                LastClearNotSet = True
+                                LastClearCode = csd.Code
+                                LastClearTime = ClearTime
+                            End If
+
+
+                        Else
+                            DurationSec = GetDurationSec(Duration)
+                            If csd.Code <> LastEventCode Or Dr Is Nothing Then
+                                Dr = Nothing
+                                For Each Drc In DT.Rows
+                                    If Drc("eventcode") = csd.Code Then
+                                        If IsDBNull(Drc("cleartime")) Then
+                                            Dr = Drc
+                                            Exit For
+                                        End If
+                                    End If
+                                Next
+                            End If
+                            If Not Dr Is Nothing Then
+
+                                ClearTime = CType(Dr("EventTime"), DateTime).AddSeconds(DurationSec)
+
+                                Dr("Duration") = Duration
+                                Dr("DurationSec") = DurationSec
+                                Dr("ClearTime") = ClearTime
+
+                                If DurationSec < 0 Then
+                                    DurationSec = DurationSec
+                                End If
+                            End If
+
+                        End If
+
+                        LastEventCode = csd.Code
+                        LastStatus = csd.Status
+                    End If
+
+                    Dim D As DateTime
+                    If csd.Status = "0" Then
+                        TimeStr = Xr.GetAttribute("TIME")
+                        If TimeStr Is Nothing Then
+                            TimeStr = Xr.GetAttribute("DATETIME")
+                        End If
+                        If DateTime.TryParseExact(TimeStr, "dd-MM-yyyy HH:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, csd.EventTime) Then
+                        Else
+                            DateTime.TryParseExact(TimeStr, "dd-MM-yyyy hh:mm:ss", CultureInfo.InvariantCulture, DateTimeStyles.None, csd.EventTime)
+                        End If
+
+                        If csd.EventTime > csd1.LastEventDate And csd.EDesc.Length > 1 Then
+                            Dr = DT.NewRow
+                            Dr("MeterNo") = csd1.MeterNo
+                            Dr("NodeID") = csd1.NodeID
+                            Dr("EventCode") = csd.Code
+                            Dr("EventDesc") = csd.EDesc
+                            Dr("EventTime") = csd.EventTime
+                            If DictCodes.ContainsKey(Val(csd.Code)) Then
+                                Dr("ISAlarm") = 1
+                            End If
+
+                            If LastClearNotSet And csd.Code = LastClearCode Then
+                                If LastClearTime >= Dr("EventTime") Then
+                                    DurationSec = DateDiff(DateInterval.Second, Dr("EventTime"), LastClearTime)
+                                    Duration = GetDurationStr(DurationSec)
+
+                                    Dr("Duration") = Duration
+                                    Dr("DurationSec") = DurationSec
+                                    Dr("ClearTime") = ClearTime
+                                    Try
+                                        Dr("ParamValuesON") = LastClearValByt
+                                    Catch ee As Exception
+                                    End Try
+                                End If
+                            End If
+
+                            DT.Rows.Add(Dr)
+                        Else
+                            Dr = Nothing
+                        End If
+                        LastEventCode = csd.Code
+                        LastStatus = csd.Status
+                    End If
+
+                End If
+            End If
+
+            If Xr.NodeType = XmlNodeType.Element AndAlso Xr.Name = "SNAPSHOT" Then
+                If Xr.HasAttributes Then
+                    AttrCnt = Xr.AttributeCount
+                    Dim Csd5 As SD2
+                    Csd5.PrmCOde = Xr.GetAttribute("PARAMCODE")
+                    Csd5.PrmUnit = Xr.GetAttribute("UNIT")
+                    Csd5.PrmValue = Xr.GetAttribute("VALUE")
+
+                    AttrID = getPrmID(Csd5.PrmCOde)
+                    Csd5.PrmID = AttrID
+
+                    If AttrID > 0 And IsNumeric(Csd5.PrmValue) Then
+                        DefUnitFactor = 1
+                        Csd5.PrmUnit = Csd5.PrmUnit.ToString.ToUpper.Trim
+
+                        DefUnitFactor = GetUnitConv(Csd5.PrmCOde, Csd5.PrmUnit)
+
+                        Csd5.RealVal = CType(Csd5.PrmValue, Single) * DefUnitFactor
+                        Dim byteArray As Byte() = BitConverter.GetBytes(AttrID)
+                        Dim byteArray2 As Byte() = BitConverter.GetBytes(Csd5.RealVal)
+
+                        PrmCount(0) = PrmCount(0) + 1
+                        MS.Write(byteArray, 0, 2)
+
+                        MS.Write(byteArray2, 0, 4)
+                    End If
+                End If
+            End If
+        Loop
+    End Sub
+
+    Sub OpenConn()
+        Try
+            CurCN.Close()
+            CurCN.Dispose()
+        Catch ex As Exception
+
+        End Try
+
+
+        CurCN = New OracleConnection
+        CurCN.ConnectionString = GetConnStr()
+
+        CurCN.Open()
+
+        OraError = False
+    End Sub
+
+    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        FirstTime = True
+        OraError = True
+
+        GlobalRecordID = 100
+
+        Timer3.Enabled = True
+    End Sub
+
+    Sub LoadList()
+        Dim di As New IO.DirectoryInfo(PubFolder)
+        Dim diar1 As IO.FileInfo() = di.GetFiles()
+        Dim dra As IO.FileInfo
+
+        ClFiles.Clear()
+        ' ListBox1.Items.Clear()
+
+        'list the names of all files in the specified directory
+        Dim i As Integer
+        i = 0
+        For Each dra In diar1
+            'ListBox1.Items.Add(dra)
+            i = i + 1
+            ClFiles.Add(dra.Name, i.ToString)
+        Next
+    End Sub
+
+    Private Sub Timer1_Tick(sender As Object, e As EventArgs) Handles Timer1.Tick
+        Dim erms As String
+        Counter = Counter + 1
+        FileError = ""
+        If ClFiles.Count >= Counter Then
+            Fn = ClFiles.Item(CStr(Counter)).ToString
+            Timer1.Enabled = False
+
+            If OraError Then
+                erms = "OraError Connecting:" & DateTime.Now.ToString & vbCrLf
+                logError(erms)
+                Timer3.Enabled = True
+                Exit Sub
+            Else
+
+                If CurCN.State <> ConnectionState.Open Then
+                    erms = "State Connecting:" & DateTime.Now.ToString & vbCrLf
+                    logError(erms)
+                    Timer3.Enabled = True
+                    Exit Sub
+                End If
+        End If
+
+
+            ReadXMLData(Fn)
+
+            'lblTotFiles.Text = Counter
+            'lblOKFiles.Text = Counter
+            Timer1.Enabled = True
+        Else
+            Timer1.Enabled = False
+            'MsgBox(Counter & " " & DateTime.Now)
+            Timer2.Enabled = True
+        End If
+    End Sub
+
+    Public Sub SaveD3Header(Dt5 As DataTable)
+        Dim Mid As Integer, EventTime As String, Mechanism As String, RecID As Integer
+        Dim Dr As DataRow
+        For Each Dr In Dt5.Rows
+            Mid = Dr("NodeID")
+            Mechanism = Dr("Mechanism")
+            RecID = Dr("RecordID")
+            If IsDBNull(Dr("RecordTime")) Then
+                EventTime = "NULL"
+            Else
+                EventTime = "TO_DATE('" & Format(Dr("RecordTime"), "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+            End If
+
+            Dim strQuery As String = "Insert Into TblBillHeader(RecordID,NodeID,RecordTime,Mechanism,MeterNo) Values(" & RecID & "," & Mid & "," & EventTime & ",'" & Mechanism & "','" & CurrentMeterNo & "')"
+            Dim cmd As OracleCommand = New OracleCommand(strQuery, CurCN)
+
+            cmd.ExecuteNonQuery()
+        Next
+
+        If Dt5.Rows.Count > 0 Then
+            Dim strUpdate As String
+            strUpdate = "update TblMeterStatus Set LastBillingDate=(Select Max(RecordTime) From TblBillHeader Where NodeID=" & Mid & ") Where MeterNo='" & CurrentMeterNo & "'"
+            Dim CmdU As New OracleCommand(strUpdate, CurCN)
+            CmdU.ExecuteNonQuery()
+        End If
+    End Sub
+
+    Public Sub SaveD3Detail(Dt5 As DataTable)
+        Dim Section As Integer, Mid As Integer, EventTime As String, Mechanism As String, RecID As Integer, ParamCode As String, ParameterId As Integer, ParameterValue As Double, Tod As Integer
+        Dim InputUnit As String, InputValue As Double
+        Dim Dr As DataRow
+        Dim cmd As OracleCommand
+        Dim strQuery As String
+        strQuery = ""
+
+        For Each Dr In Dt5.Rows
+            Section = Dr("Section")
+            Mid = Dr("NodeID")
+            RecID = Dr("RecordID")
+            ParamCode = IIf(IsDBNull(Dr("ParamCode")), "", Dr("ParamCode"))
+            ParameterId = IIf(IsDBNull(Dr("ParamId")), 0, Dr("ParamId"))
+            ParameterValue = IIf(IsDBNull(Dr("ParamValue")), 0, Dr("ParamValue"))
+
+            InputUnit = IIf(IsDBNull(Dr("InputUnit")), "", Dr("InputUnit"))
+            InputValue = IIf(IsDBNull(Dr("InputValue")), 0, Dr("InputValue"))
+
+            If IsDBNull(Dr("tod")) Then
+                Tod = -1
+            Else
+                Tod = Dr("tod")
+            End If
+
+
+            If IsDBNull(Dr("OccDate")) Then
+                EventTime = "NULL"
+            Else
+                EventTime = "TO_DATE('" & Format(Dr("OccDate"), "dd-MMM-yyyy hh:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+            End If
+
+            strQuery = ""
+
+            If Section = 3 Then
+                strQuery = "Insert into TblBillingEnergy(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,MeterNo,InputUnit,InputValue) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & ",'" & CurrentMeterNo & "','" & InputUnit & "'," & InputValue & ")"
+            ElseIf Section = 4 Then
+                strQuery = "Insert into TblBillingTodEnergy(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,Tod,MeterNo,InputUnit,InputValue) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & "," & Tod & ",'" & CurrentMeterNo & "','" & InputUnit & "'," & InputValue & ")"
+            ElseIf Section = 5 Then
+                strQuery = "Insert into TblBillingDemand(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,OccDate,MeterNo,InputUnit,InputValue) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & "," & EventTime & ",'" & CurrentMeterNo & "','" & InputUnit & "'," & InputValue & ")"
+            ElseIf Section = 6 Then
+                strQuery = "Insert into TblBillingTODDemand(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,Tod,OccDate,MeterNo,InputUnit,InputValue) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & "," & Tod & "," & EventTime & ",'" & CurrentMeterNo & "','" & InputUnit & "'," & InputValue & ")"
+            ElseIf Section = 9 Then
+                strQuery = "Insert into TblBillingPF(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,MeterNo) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & ",'" & CurrentMeterNo & "')"
+            ElseIf Section = 10 Then
+                strQuery = "Insert into TblBillingTODPF(RecordId,ParamCode,ParameterId,ParameterValue,NodeID,Tod,MeterNo) VALUES( " & RecID & ",'" & ParamCode & "'," & ParameterId & "," & ParameterValue & "," & Mid & "," & Tod & ",'" & CurrentMeterNo & "')"
+            End If
+
+            If strQuery.Length > 10 Then
+                cmd = New OracleCommand(strQuery, CurCN)
+                cmd.ExecuteNonQuery()
+            End If
+        Next
+
+    End Sub
+
+    Public Sub SaveD5(Dt5 As DataTable)
+        Dim ECode As Integer, EDesc As String, MNo As String, Mid As Integer, EventTime As String, Duration As String, DurationSec As Integer, ClearTime As String
+        Dim IsAlarm As Byte, PValON() As Byte, PValOFF() As Byte, Dr As DataRow
+        For Each Dr In Dt5.Rows
+            ECode = Dr("EventCode")
+            EDesc = Dr("EventDesc")
+            MNo = Dr("MeterNo")
+            Mid = Dr("NodeID")
+            EventTime = "TO_DATE('" & Format(Dr("EventTime"), "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+            Duration = IIf(IsDBNull(Dr("Duration")), "", Dr("Duration"))
+            DurationSec = IIf(IsDBNull(Dr("DurationSec")), 0, Dr("DurationSec"))
+
+            If IsDBNull(Dr("ClearTime")) Then
+                ClearTime = "NULL"
+            Else
+                ClearTime = "TO_DATE('" & Format(Dr("ClearTime"), "dd-MMM-yyyy HH:mm:ss") & "','DD-MON-YYYY HH24:MI:SS')"
+            End If
+            If IsDBNull(Dr("ISAlarm")) Then
+                IsAlarm = 0
+            Else
+                IsAlarm = Dr("ISAlarm")
+            End If
+
+            'IsAlarm = 1
+
+            Dim objSqlBinary As New System.Data.SqlTypes.SqlBinary
+            objSqlBinary = Dr.Item("ParamValuesON")
+            If objSqlBinary.IsNull Then
+                ReDim PValON(0)
+                PValON(0) = 0
+            Else
+                PValON = CType(objSqlBinary, Byte())
+            End If
+
+            objSqlBinary = Dr.Item("ParamValuesOFF")
+            If objSqlBinary.IsNull Then
+                ReDim PValOFF(0)
+                PValOFF(0) = 0
+            Else
+                PValOFF = CType(objSqlBinary, Byte())
+            End If
+
+            Dim strQuery As String = "insert into TblEventDetail(RecordID,NodeID,MeterNo,EventCode,EventDesc,EventTime,ClearTime,Duration,DurationSec,IsAlarm,ParamValuesON,ParamValuesOFF) values (EVENTIDS.NEXTVAL," & Mid & ",'" & MNo & "'," & ECode & ",'" & EDesc & "'," & EventTime & "," & ClearTime & ",'" & Duration & "'," & DurationSec & "," & IsAlarm & ",:EDataON,:EDataOFF)"
+            Dim cmd As OracleCommand = New OracleCommand(strQuery, CurCN)
+            cmd.Parameters.Add("EDataON", OracleDbType.Raw).Value = PValON
+            cmd.Parameters.Add("EDataON", OracleDbType.Raw).Value = PValOFF
+
+            cmd.ExecuteNonQuery()
+
+
+
+        Next
+
+        If Dt5.Rows.Count > 0 Then
+            Dim strUpdate As String
+            strUpdate = "update TblMeterStatus Set LastEventDate=(Select Max(EventTime) From TblEventDetail Where NodeID=" & Mid & ") Where Meterno='" & CurrentMeterNo & "'"
+            Dim CmdU As New OracleCommand(strUpdate, CurCN)
+            CmdU.ExecuteNonQuery()
+        End If
+    End Sub
+
+ 
+
+    Public Function GetValuesTable(Dt As DateTime) As DataTable
+        Dim ErrCode As Integer, DtVals As DataTable, Drw As DataRow, B1Len As Integer
+        Dim BytData() As Byte, BytData1() As Byte, BytData2() As Byte, BytData3() As Byte, BytData4() As Byte, TotLen As Integer, CurTotLen As Integer
+        Dim DtCurrent As DataTable
+        Dim CurCN As New OracleConnection
+        CurCN.ConnectionString = GetConnStr()
+        CurCN.Open()
+
+        DtVals = GetTable("Select * From TblBillCurrent Where NodeID=48 AND RecordDate>=TO_DATE('" & Format(Dt, "dd-MMM-yyyy") & "','DD-MON-YYYY')" & " AND RecordDate<=TO_DATE('" & Format(Dt.AddDays(1), "dd-MMM-yyyy") & "','DD-MON-YYYY')", CurCN)
+        If DtVals.Rows.Count > 0 Then
+            CurTotLen = 0
+            Drw = DtVals.Rows(0)
+            TotLen = Drw.Item("TotLen")
+            BytData1 = CType(Drw.Item("InstData1"), Byte())
+            BytData2 = CType(Drw.Item("InstData2"), Byte())
+            BytData3 = CType(Drw.Item("InstData3"), Byte())
+            BytData4 = CType(Drw.Item("InstData4"), Byte())
+
+            ReDim Preserve BytData(TotLen - 1)
+            If TotLen >= CurTotLen + BytData1.Length Then
+                Array.Copy(BytData1, 0, BytData, CurTotLen, BytData1.Length)
+                CurTotLen = CurTotLen + BytData1.Length
+            End If
+            If TotLen >= CurTotLen + BytData2.Length Then
+                Array.Copy(BytData2, 0, BytData, CurTotLen, BytData2.Length)
+                CurTotLen = CurTotLen + BytData2.Length
+            End If
+            If TotLen >= CurTotLen + BytData3.Length Then
+                Array.Copy(BytData3, 0, BytData, CurTotLen, BytData3.Length)
+                CurTotLen = CurTotLen + BytData2.Length
+            End If
+            If TotLen >= CurTotLen + BytData4.Length Then
+                Array.Copy(BytData4, 0, BytData, CurTotLen, BytData4.Length)
+                CurTotLen = CurTotLen + BytData4.Length
+            End If
+
+            DtCurrent = DecompressData(BytData)
+            'MsgBox(DtCurrent.Rows(0).Item(1).ToString)
+        End If
+        Return DtVals
+    End Function
+
+
+    Private Sub Timer2_Tick(sender As Object, e As EventArgs) Handles Timer2.Tick
+        Timer2.Enabled = False
+        LoadList()
+        Counter = 0
+        Timer1.Enabled = True
+    End Sub
+
+    Sub Compress(filename As String, zippedFile As String)
+        If IO.File.Exists(zippedFile) Then
+
+        Else
+            If IO.File.Exists(filename) Then
+                Using archive As ZipArchive = ZipFile.Open(zippedFile, ZipArchiveMode.Create)
+                    archive.CreateEntryFromFile(filename, Path.GetFileName(filename), CompressionLevel.Fastest)
+                End Using
+
+            End If
+        End If
+        Try
+            File.Delete(filename)
+
+        Catch ex As Exception
+
+        End Try
+    End Sub
+
+    Private Sub Timer3_Tick(sender As Object, e As EventArgs) Handles Timer3.Tick
+        If OraError Then
+            OpenConn()
+        End If
+
+        If Not OraError Then
+            If CurCN.State = ConnectionState.Open Then
+                If FirstTime Then
+                    loadDefaults()
+                    FirstTime = False
+
+                End If
+                Timer3.Enabled = False
+                Timer2.Enabled = True
+                logError("Connection opened at" & DateTime.Now.ToString)
+                Exit Sub
+            Else
+                OraError = True
+            End If
+            
+        End If
+
+    End Sub
+
+    Sub loadDefaults()
+        PubFolder = GetSourceFolder()
+        DestinationFolder = GetDestinationFolder()
+
+        Dim DtBH As DataTable
+        DtBH = GetTable("select max(recordid) from tblbillHeader", CurCN)
+        If DtBH.Rows.Count = 0 Then
+            GlobalRecordID = 1
+        Else
+            If IsDBNull(DtBH.Rows(0).Item(0)) Then
+                GlobalRecordID = 1
+            Else
+                GlobalRecordID = DtBH.Rows(0).Item(0)
+            End If
+        End If
+
+        LoadParameters()
+        LoadEventCodes()
+
+        lblSourceFolder.Text = PubFolder
+        lblStart.Text = DateTime.Now
+
+        If Not Directory.Exists(PubFolder) Then
+            lblError.Text = "Invalid Source Folder"
+            Exit Sub
+        End If
+        If Not Directory.Exists(DestinationFolder) Then
+            lblError.Text = "Invalid Destination Folder"
+            Exit Sub
+        End If
+
+    End Sub
+    Private Sub Button2_Click_1(sender As Object, e As EventArgs) Handles Button2.Click
+        CurCN.Close()
+    End Sub
+End Class
